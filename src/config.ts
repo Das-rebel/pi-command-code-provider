@@ -21,6 +21,41 @@ export type CommandCodeProviderModelConfig = ProviderModelConfig & {
   importOwnership?: "model-discovery" | "manual" | string;
 };
 
+export interface RetryConfigSection {
+  maxRetries?: number;
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  jitterFactor?: number;
+  failureThreshold?: number;
+  recoveryTimeoutMs?: number;
+}
+
+export interface CacheConfigSection {
+  enabled?: boolean;
+  maxSize?: number;
+  similarityThreshold?: number;
+  ttlMs?: number;
+}
+
+export interface BudgetConfigSection {
+  dailyLimitUsd?: number;
+  monthlyLimitUsd?: number;
+}
+
+export interface GitContextConfigSection {
+  enabled?: boolean;
+  timeoutMs?: number;
+}
+
+export interface ImageConfigSection {
+  enabled?: boolean;
+  maxBytes?: number;
+}
+
+export interface GuardrailsConfigSection {
+  enabled?: boolean;
+}
+
 export interface ExtensionConfig {
   enabled: boolean;
   debug: boolean;
@@ -34,6 +69,12 @@ export interface ExtensionConfig {
   memory: string;
   headers: Record<string, string>;
   models: CommandCodeProviderModelConfig[];
+  retry: RetryConfigSection;
+  cache: CacheConfigSection;
+  budget: BudgetConfigSection;
+  gitContext: GitContextConfigSection;
+  images: ImageConfigSection;
+  guardrails: GuardrailsConfigSection;
 }
 
 export interface ConfigLoadResult {
@@ -118,6 +159,59 @@ function stringRecordOr(value: unknown, fallback?: Record<string, string>): Reco
 function recordOr(value: unknown, fallback?: Record<string, unknown>): Record<string, unknown> | undefined {
   if (isRecord(value)) return { ...value };
   return fallback ? { ...fallback } : undefined;
+}
+
+function retrySectionOr(value: unknown): ExtensionConfig["retry"] {
+  if (!isRecord(value)) return {};
+  return {
+    maxRetries: typeof value.maxRetries === "number" ? value.maxRetries : undefined,
+    baseDelayMs: typeof value.baseDelayMs === "number" ? value.baseDelayMs : undefined,
+    maxDelayMs: typeof value.maxDelayMs === "number" ? value.maxDelayMs : undefined,
+    jitterFactor: typeof value.jitterFactor === "number" ? value.jitterFactor : undefined,
+    failureThreshold: typeof value.failureThreshold === "number" ? value.failureThreshold : undefined,
+    recoveryTimeoutMs: typeof value.recoveryTimeoutMs === "number" ? value.recoveryTimeoutMs : undefined,
+  };
+}
+
+function cacheSectionOr(value: unknown): ExtensionConfig["cache"] {
+  if (!isRecord(value)) return {};
+  return {
+    enabled: typeof value.enabled === "boolean" ? value.enabled : undefined,
+    maxSize: typeof value.maxSize === "number" ? value.maxSize : undefined,
+    similarityThreshold: typeof value.similarityThreshold === "number" ? value.similarityThreshold : undefined,
+    ttlMs: typeof value.ttlMs === "number" ? value.ttlMs : undefined,
+  };
+}
+
+function budgetSectionOr(value: unknown): ExtensionConfig["budget"] {
+  if (!isRecord(value)) return {};
+  return {
+    dailyLimitUsd: typeof value.dailyLimitUsd === "number" ? value.dailyLimitUsd : undefined,
+    monthlyLimitUsd: typeof value.monthlyLimitUsd === "number" ? value.monthlyLimitUsd : undefined,
+  };
+}
+
+function gitContextSectionOr(value: unknown): ExtensionConfig["gitContext"] {
+  if (!isRecord(value)) return {};
+  return {
+    enabled: typeof value.enabled === "boolean" ? value.enabled : undefined,
+    timeoutMs: typeof value.timeoutMs === "number" ? value.timeoutMs : undefined,
+  };
+}
+
+function imageSectionOr(value: unknown): ExtensionConfig["images"] {
+  if (!isRecord(value)) return {};
+  return {
+    enabled: typeof value.enabled === "boolean" ? value.enabled : undefined,
+    maxBytes: typeof value.maxBytes === "number" ? value.maxBytes : undefined,
+  };
+}
+
+function guardrailsSectionOr(value: unknown): ExtensionConfig["guardrails"] {
+  if (!isRecord(value)) return {};
+  return {
+    enabled: typeof value.enabled === "boolean" ? value.enabled : undefined,
+  };
 }
 
 function capabilitiesOr(value: unknown, fallback?: CapabilityFlags): CapabilityFlags | undefined {
@@ -351,6 +445,12 @@ export function loadConfig(extensionRoot: string): ConfigLoadResult {
       memory: typeof raw.memory === "string" ? raw.memory : "",
       headers: stringRecordOr(raw.headers) ?? {},
       models,
+      retry: retrySectionOr(raw.retry),
+      cache: cacheSectionOr(raw.cache),
+      budget: budgetSectionOr(raw.budget),
+      gitContext: gitContextSectionOr(raw.gitContext),
+      images: imageSectionOr(raw.images),
+      guardrails: guardrailsSectionOr(raw.guardrails),
     },
     warnings,
   };

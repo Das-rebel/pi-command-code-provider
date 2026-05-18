@@ -16,78 +16,33 @@ import {
 
 import type { ExtensionConfig } from "./config.js";
 import type { DebugLogger } from "./debug-logger.js";
+import { BackpressureController } from "./backpressure.js";
+import { RetryHandler } from "./retry.js";
+import { encodeImage } from "./image-handler.js";
+import { resolveGitContext } from "./git-context.js";
+import { TOOL_ALIASES, normalizeToolArguments } from "./tool-aliases.js";
+import { applyGuardrails } from "./guardrails.js";
+import type { CommandCodeContentPart, CommandCodeMessage, CommandCodeResponse, CommandCodeRequest, CommandCodeTool, ParsedContentBlock, ToolInputAccumulator } from "./types.js";
+
+// ---------------------------------------------------------------------------
+// Runtime state
+// ---------------------------------------------------------------------------
 
 interface CommandCodeRuntimeState {
   cwd?: string;
 }
 
-interface CommandCodeContentPart {
-  type: string;
-  text?: string;
-  image?: string;
-  thinking?: string;
-  id?: string;
-  name?: string;
-  input?: unknown;
-  arguments?: unknown;
-  toolCallId?: string;
-  toolName?: string;
-  output?: { type: "text" | "error-text"; value: string };
-  isError?: boolean;
-}
-
-interface CommandCodeMessage {
-  role: "user" | "assistant" | "tool";
-  content: string | CommandCodeContentPart[];
-}
-
-interface CommandCodeTool {
-  name: string;
-  description: string;
-  input_schema: unknown;
-}
-
-interface CommandCodeRequest {
-  memory: string;
-  taste: null;
-  skills: string;
-  params: {
-    tools?: CommandCodeTool[];
-    stream: true;
-    max_tokens: number;
-    temperature?: number;
-    system?: string;
-    messages: CommandCodeMessage[];
-    model: string;
-  };
-  config: Record<string, unknown>;
-}
-
-interface CommandCodeResponse {
-  id?: unknown;
-  role?: unknown;
-  model?: unknown;
-  content?: unknown;
-  stop_reason?: unknown;
-  usage?: unknown;
-  error?: unknown;
-  message?: unknown;
-}
-
-type ParsedContentBlock =
-  | { type: "text"; text: string }
-  | { type: "thinking"; thinking: string }
-  | { type: "toolCall"; toolCall: ToolCall };
-
-interface ToolInputAccumulator {
-  id: string;
-  toolName: string;
-  inputText: string;
-}
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
 const ENV_VAR_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
 const DEFAULT_MAX_OUTPUT_TOKENS = 64_000;
 const API_MAX_OUTPUT_TOKENS = 200_000;
+
+// ---------------------------------------------------------------------------
+// Utility functions
+// ---------------------------------------------------------------------------
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -101,25 +56,38 @@ function nowDate(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+// ---------------------------------------------------------------------------
+// Config builder (uses resolveGitContext)
+// ---------------------------------------------------------------------------
+
 function buildCommandConfig(runtime: CommandCodeRuntimeState): Record<string, unknown> {
+  const git = resolveGitContext(runtime.cwd);
   return {
     workingDir: runtime.cwd ?? "",
     date: nowDate(),
     environment: `${process.platform}-${process.arch}, Node ${process.version}`,
-    structure: [],
-    isGitRepo: false,
-    currentBranch: "",
-    mainBranch: "main",
-    gitStatus: "",
-    recentCommits: [],
+    structure: git.structure,
+    isGitRepo: git.isGitRepo,
+    currentBranch: git.currentBranch,
+    mainBranch: git.mainBranch,
+    gitStatus: git.gitStatus,
+    recentCommits: git.recentCommits,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Content builders (use encodeImage)
+// ---------------------------------------------------------------------------
 
 function textPart(text: string): CommandCodeContentPart {
   return { type: "text", text };
 }
 
-function imagePlaceholder(_image: ImageContent): CommandCodeContentPart {
+function imageToContentPart(image: ImageContent): CommandCodeContentPart {
+  const encoded = encodeImage(image);
+  if (encoded) {
+    return { type: "image", image: encoded.source.data } as CommandCodeContentPart;
+  }
   return textPart("[image omitted]");
 }
 
@@ -130,7 +98,7 @@ function textFromContent(content: string | (TextContent | ImageContent)[]): stri
 
 function userContent(content: string | (TextContent | ImageContent)[]): string | CommandCodeContentPart[] {
   if (typeof content === "string") return content;
-  const parts = content.map((part) => (part.type === "text" ? textPart(part.text) : imagePlaceholder(part)));
+  const parts = content.map((part) => (part.type === "text" ? textPart(part.text) : imageToContentPart(part)));
   if (parts.length === 1 && parts[0].type === "text") return parts[0].text ?? "";
   return parts.length > 0 ? parts : "";
 }
@@ -169,11 +137,27 @@ function toolResultContent(message: Extract<Context["messages"][number], { role:
   ];
 }
 
-function buildMessages(context: Context): CommandCodeMessage[] {
+// ---------------------------------------------------------------------------
+// Message / tool / prompt builders
+// ---------------------------------------------------------------------------
+
+function buildMessages(context: Context, config: ExtensionConfig): CommandCodeMessage[] {
   const messages: CommandCodeMessage[] = [];
   for (const message of context.messages) {
     if (message.role === "user") {
-      messages.push({ role: "user", content: userContent(message.content) });
+      let content = message.content;
+      // Apply PII guardrails to user messages if enabled
+      if (config.guardrails?.enabled && typeof content === "string") {
+        content = applyGuardrails(content).text;
+      } else if (config.guardrails?.enabled && Array.isArray(content)) {
+        content = content.map((part) => {
+          if (part.type === "text") {
+            return { ...part, text: applyGuardrails(part.text).text };
+          }
+          return part;
+        }) as (TextContent | ImageContent)[];
+      }
+      messages.push({ role: "user", content: userContent(content) });
     } else if (message.role === "assistant") {
       messages.push({ role: "assistant", content: assistantContent(message) });
     } else if (message.role === "toolResult") {
@@ -238,12 +222,16 @@ function buildRequest(model: Model<Api>, context: Context, config: ExtensionConf
       max_tokens: resolveMaxTokens(model, options),
       temperature: options?.temperature,
       system: buildSystemPrompt(config, context),
-      messages: buildMessages(context),
+      messages: buildMessages(context, config),
       model: model.id,
     },
     config: buildCommandConfig(runtime),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Auth / headers / signal
+// ---------------------------------------------------------------------------
 
 function resolveApiKey(config: ExtensionConfig, options?: SimpleStreamOptions): string {
   const apiKey = options?.apiKey;
@@ -288,6 +276,10 @@ function createRequestSignal(options: SimpleStreamOptions | undefined, timeoutMs
   };
 }
 
+// ---------------------------------------------------------------------------
+// Response parsing
+// ---------------------------------------------------------------------------
+
 function responseHeadersToRecord(headers: Headers): Record<string, string> {
   const output: Record<string, string> = {};
   headers.forEach((value, key) => {
@@ -315,6 +307,10 @@ function extractErrorMessage(payload: CommandCodeResponse, status: number): stri
   }
   return `CommandCode request failed with HTTP ${status}.`;
 }
+
+// ---------------------------------------------------------------------------
+// Usage parsing
+// ---------------------------------------------------------------------------
 
 function numberFrom(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
@@ -356,6 +352,10 @@ function parseEventUsage(model: Model<Api>, rawUsage: unknown): Usage | undefine
   calculateCost(model, usage);
   return usage;
 }
+
+// ---------------------------------------------------------------------------
+// Content block parsing (text, thinking, tool calls)
+// ---------------------------------------------------------------------------
 
 function flattenTextContent(content: unknown): string {
   if (typeof content === "string") return content;
@@ -507,6 +507,10 @@ function parseContentBlocks(content: unknown): ParsedContentBlock[] {
   return blocks;
 }
 
+// ---------------------------------------------------------------------------
+// Stop reason mapping
+// ---------------------------------------------------------------------------
+
 function mapStopReason(rawStopReason: unknown, hasToolCalls: boolean): { stopReason: "stop" | "length" | "toolUse" | "error"; errorMessage?: string } {
   const reason = typeof rawStopReason === "string" ? rawStopReason : "stop";
   switch (reason) {
@@ -527,6 +531,10 @@ function mapStopReason(rawStopReason: unknown, hasToolCalls: boolean): { stopRea
       return { stopReason: hasToolCalls ? "toolUse" : "stop" };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Stream emission helpers
+// ---------------------------------------------------------------------------
 
 function createOutput(model: Model<Api>): AssistantMessage {
   return {
@@ -602,46 +610,10 @@ function hasTool(context: Context, name: string): boolean {
   return context.tools?.some((tool) => tool.name === name) ?? false;
 }
 
-const COMMAND_CODE_TOOL_ALIASES: Record<string, string> = {
-  read_file: "read",
-  write_file: "write",
-  edit_file: "edit",
-  read_directory: "ls",
-  shell_command: "bash",
-  glob: "find",
-};
-
-function normalizeToolArguments(name: string, args: Record<string, unknown>): Record<string, unknown> {
-  if (name === "grep" && Object.hasOwn(args, "filePattern") && !Object.hasOwn(args, "glob")) {
-    const { filePattern, ...rest } = args;
-    return { ...rest, glob: filePattern };
-  }
-  if (name === "read" && Object.hasOwn(args, "absolutePath") && !Object.hasOwn(args, "path")) {
-    const { absolutePath, ...rest } = args;
-    return { ...rest, path: absolutePath };
-  }
-  if (name === "write" && Object.hasOwn(args, "filePath") && !Object.hasOwn(args, "path")) {
-    const { filePath, ...rest } = args;
-    return { ...rest, path: filePath };
-  }
-  if (name === "edit" && (Object.hasOwn(args, "filePath") || Object.hasOwn(args, "oldValue") || Object.hasOwn(args, "newValue"))) {
-    const { filePath, oldValue, newValue, replaceAll: _replaceAll, replacementCount: _replacementCount, ...rest } = args;
-    if (Object.hasOwn(args, "edits")) return { ...rest, filePath, oldValue, newValue };
-    if (typeof oldValue === "string" && typeof newValue === "string") {
-      return { ...rest, path: typeof filePath === "string" ? filePath : rest.path, edits: [{ oldText: oldValue, newText: newValue }] };
-    }
-    return { ...rest, path: typeof filePath === "string" ? filePath : rest.path };
-  }
-  if (name === "bash" && Object.hasOwn(args, "command") && !Object.hasOwn(args, "timeout")) {
-    return args;
-  }
-  return args;
-}
-
 function normalizeToolCallForContext(toolCall: ToolCall, context: Context): ToolCall {
-  const alias = COMMAND_CODE_TOOL_ALIASES[toolCall.name];
+  const alias = TOOL_ALIASES[toolCall.name];
   const name = alias && hasTool(context, alias) && !hasTool(context, toolCall.name) ? alias : toolCall.name;
-  return { ...toolCall, name, arguments: normalizeToolArguments(name, toolCall.arguments) };
+  return { ...toolCall, name, arguments: normalizeToolArguments(name, toolCall.arguments as Record<string, unknown>) };
 }
 
 function emitToolCall(stream: AssistantMessageEventStream, output: AssistantMessage, toolCall: ToolCall, context: Context): void {
@@ -687,6 +659,10 @@ function emitResponse(stream: AssistantMessageEventStream, output: AssistantMess
   stream.end(output);
 }
 
+// ---------------------------------------------------------------------------
+// SSE parsing
+// ---------------------------------------------------------------------------
+
 function parseSseLine(line: string): unknown | undefined {
   const trimmed = line.trim();
   if (!trimmed) return undefined;
@@ -707,7 +683,11 @@ function eventId(event: Record<string, unknown>): string {
   return typeof event.id === "string" ? event.id : "default";
 }
 
-async function consumeEventStream(response: Response, stream: AssistantMessageEventStream, output: AssistantMessage, model: Model<Api>, context: Context): Promise<void> {
+// ---------------------------------------------------------------------------
+// Event stream consumer (with backpressure)
+// ---------------------------------------------------------------------------
+
+async function consumeEventStream(response: Response, stream: AssistantMessageEventStream, output: AssistantMessage, model: Model<Api>, context: Context, logger: DebugLogger): Promise<void> {
   stream.push({ type: "start", partial: output });
   const textBlocks = new Map<string, number>();
   const thinkingBlocks = new Map<string, number>();
@@ -715,6 +695,9 @@ async function consumeEventStream(response: Response, stream: AssistantMessageEv
   let hasToolCalls = false;
   let finalReason: "stop" | "length" | "toolUse" | "error" = "stop";
   let finalError: string | undefined;
+
+  // Backpressure controller: yield when buffered > 1MB
+  const backpressure = new BackpressureController();
 
   const handleEvent = (event: unknown): void => {
     if (!isRecord(event)) return;
@@ -729,13 +712,18 @@ async function consumeEventStream(response: Response, stream: AssistantMessageEv
       const id = eventId(event);
       const contentIndex = textBlocks.get(id) ?? emitTextStart(stream, output);
       textBlocks.set(id, contentIndex);
-      emitTextDelta(stream, output, contentIndex, eventText(event));
+      const text = eventText(event);
+      emitTextDelta(stream, output, contentIndex, text);
+      backpressure.record(text.length);
       return;
     }
     if (type === "text-end") {
       const id = eventId(event);
       const contentIndex = textBlocks.get(id);
-      if (contentIndex !== undefined) emitTextEnd(stream, output, contentIndex);
+      if (contentIndex !== undefined) {
+        emitTextEnd(stream, output, contentIndex);
+        backpressure.consume(64); // approximate emit overhead
+      }
       textBlocks.delete(id);
       return;
     }
@@ -748,7 +736,9 @@ async function consumeEventStream(response: Response, stream: AssistantMessageEv
       const id = eventId(event);
       const contentIndex = thinkingBlocks.get(id) ?? emitThinkingStart(stream, output);
       thinkingBlocks.set(id, contentIndex);
-      emitThinkingDelta(stream, output, contentIndex, eventText(event));
+      const text = eventText(event);
+      emitThinkingDelta(stream, output, contentIndex, text);
+      backpressure.record(text.length);
       return;
     }
     if (type === "reasoning-end" || type === "thinking-end") {
@@ -767,8 +757,10 @@ async function consumeEventStream(response: Response, stream: AssistantMessageEv
     if (type === "tool-input-delta") {
       const id = eventId(event);
       const accumulator = toolInputs.get(id) ?? { id, toolName: optionalString(event.toolName) ?? "tool", inputText: "" };
-      accumulator.inputText += eventText(event);
+      const text = eventText(event);
+      accumulator.inputText += text;
       toolInputs.set(id, accumulator);
+      backpressure.record(text.length);
       return;
     }
     if (type === "tool-call") {
@@ -817,10 +809,18 @@ async function consumeEventStream(response: Response, stream: AssistantMessageEv
   let buffered = "";
   if (!response.body) throw new Error("CommandCode response did not include a readable body.");
   for await (const chunk of response.body as AsyncIterable<Uint8Array>) {
-    buffered += decoder.decode(chunk, { stream: true });
+    const chunkText = decoder.decode(chunk, { stream: true });
+    buffered += chunkText;
+
+    // Apply backpressure based on raw chunk size
+    await backpressure.record(chunk.byteLength);
+
     const lines = buffered.split(/\r?\n/);
     buffered = lines.pop() ?? "";
     for (const line of lines) handleEvent(parseSseLine(line));
+
+    // Yield control after processing each chunk
+    await backpressure.record(0);
   }
   buffered += decoder.decode();
   if (buffered.trim()) {
@@ -842,6 +842,13 @@ async function consumeEventStream(response: Response, stream: AssistantMessageEv
   stream.end(output);
 }
 
+// ---------------------------------------------------------------------------
+// Main request execution (with retry handler)
+// ---------------------------------------------------------------------------
+
+// Module-level retry handler (shared across requests)
+const retryHandler = new RetryHandler();
+
 async function executeCommandCodeRequest(
   stream: AssistantMessageEventStream,
   output: AssistantMessage,
@@ -857,23 +864,28 @@ async function executeCommandCodeRequest(
   try {
     const request = buildRequest(model, context, config, runtime, options);
     const payload = options?.onPayload ? (await options.onPayload(request, model)) ?? request : request;
-    const response = await fetch(`${config.upstreamUrl.replace(/\/+$/, "")}/alpha/generate`, {
-      method: "POST",
-      headers: buildHeaders(config, apiKey, options),
-      body: JSON.stringify(payload),
-      signal: signal.signal,
+
+    const response = await retryHandler.execute(async () => {
+      const res = await fetch(`${config.upstreamUrl.replace(/\/+$/, "")}/alpha/generate`, {
+        method: "POST",
+        headers: buildHeaders(config, apiKey, options),
+        body: JSON.stringify(payload),
+        signal: signal.signal,
+      });
+
+      if (!res.ok) {
+        const errorPayload = await readJsonResponse(res);
+        throw new Error(extractErrorMessage(errorPayload, res.status));
+      }
+
+      return res;
     });
 
     await options?.onResponse?.({ status: response.status, headers: responseHeadersToRecord(response.headers) }, model);
 
-    if (!response.ok) {
-      const errorPayload = await readJsonResponse(response);
-      throw new Error(extractErrorMessage(errorPayload, response.status));
-    }
-
     const contentType = response.headers.get("content-type") ?? "";
     if (contentType.includes("text/event-stream")) {
-      await consumeEventStream(response, stream, output, model, context);
+      await consumeEventStream(response, stream, output, model, context, logger);
       return;
     }
 
@@ -890,6 +902,10 @@ async function executeCommandCodeRequest(
     signal.dispose();
   }
 }
+
+// ---------------------------------------------------------------------------
+// Public factory
+// ---------------------------------------------------------------------------
 
 export function createCommandCodeStream(config: ExtensionConfig, runtime: CommandCodeRuntimeState, logger: DebugLogger) {
   return (model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream => {
