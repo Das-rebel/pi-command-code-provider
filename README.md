@@ -1,69 +1,25 @@
 # pi-command-code-provider
 
-**Pi extension for [CommandCode](https://commandcode.dev/)'s native `/alpha/generate` API.**
+Pi extension provider for [CommandCode](https://commandcode.dev/)'s native `/alpha/generate` API.
 
-OpenCode, Kimi, MiniMax, Qwen, Groq, Cerebras — all through one provider interface.
+## Overview
 
----
-
-## What It Does
-
-Registers CommandCode as a model provider in Pi (personal AI agent). Supports:
-
-- **Streaming completions** — real-time token streaming
-- **Tool calling** — function calling / tool use
-- **Reasoning modes** — thinking levels (o1/c4/c5)
-- **Model catalog** — configurable via `config.json`
-
-```
-┌─────────────────────────────────────┐
-│  Pi Agent                          │
-│                                     │
-│  Extension: pi-command-code-provider│
-│  → CommandCode API                  │
-│     → OpenCode / Kimi / MiniMax     │
-│     → Qwen / Groq / Cerebras       │
-└─────────────────────────────────────┘
-```
-
----
-
-## Supported Models
-
-| Provider | Models |
-|----------|--------|
-| **OpenCode** | deepseek-v4-flash-free, minimax-m2.5-free, nemotron-3-super-free, qwen3.6-plus-free |
-| **Moonshot** | Kimi-K2.5, Kimi-K2-instruct |
-| **MiniMax** | MiniMax-M2.1, M2.5, M2.7 (+ highspeed variants) |
-| **Qwen** | Qwen3-32B (via Groq) |
-| **Groq** | Llama 3.1 8B/70B, Qwen 3 32B, Allam 2, Compound |
-| **Cerebras** | Llama 3.1 8B, Qwen 3 235B |
-
----
+This extension registers CommandCode as a model provider inside Pi.
+It supports streaming completions, tool calling, reasoning/thinking levels, and configurable model catalogs via a local `config.json`.
 
 ## Installation
 
-```bash
-# 1. Clone into Pi extensions directory
-git clone https://github.com/Das-rebel/pi-command-code-provider.git \
-  ~/path-to-pi/agent/extensions/pi-command-code-provider
-
-# 2. Install dependencies
-cd pi-command-code-provider
-npm install
-
-# 3. Configure (optional — uses bundled defaults otherwise)
-cp config.example.json config.json
-# Edit config.json with your API key
-
-# 4. Restart Pi
-```
-
----
+1. Clone or copy this extension into your Pi `agent/extensions/` directory (or any path Pi loads extensions from).
+2. Install dependencies:
+   ```bash
+   npm install
+   ```
+3. Drop a `config.json` next to `package.json` (see **Configuration** below).
+4. Restart Pi.
 
 ## Configuration
 
-Create `config.json` in the extension root:
+Create `config.json` in the extension root. Example:
 
 ```json
 {
@@ -76,66 +32,42 @@ Create `config.json` in the extension root:
   "commandCodeVersion": "auto",
   "commandCodeProvider": "commandcode",
   "requestTimeoutMs": 300000,
+  "memory": "",
+  "headers": {},
   "models": [
     {
       "id": "moonshotai/Kimi-K2.5",
       "name": "Kimi K2.5",
       "contextWindow": 262144,
       "maxTokens": 262144
-    },
-    {
-      "id": "minimax/MiniMax-M2.5",
-      "name": "MiniMax M2.5",
-      "contextWindow": 100000,
-      "maxTokens": 100000
     }
   ]
 }
 ```
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `enabled` | boolean | `true` | Toggle provider on/off |
-| `debug` | boolean | `false` | Enable debug logging |
-| `providerId` | string | `"command-code"` | Internal ID for Pi |
-| `displayName` | string | `"Command Code"` | Shown in Pi UI |
-| `upstreamUrl` | string | API endpoint | CommandCode base URL |
-| `apiKey` | string | `""` | Your CommandCode key |
-| `requestTimeoutMs` | number | `300000` | 5 minute timeout |
-| `models` | array | bundled | Available models |
-
----
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | `boolean` | `true` | Toggle the provider on/off. |
+| `debug` | `boolean` | `false` | Enable debug logging to a local file. |
+| `providerId` | `string` | `"command-code"` | Internal provider identifier. |
+| `displayName` | `string` | `"Command Code"` | Human-readable provider name. |
+| `upstreamUrl` | `string` | `"https://api.commandcode.dev"` | Base URL for the CommandCode API. |
+| `apiKey` | `string` | `""` | API key for authentication. |
+| `commandCodeVersion` | `string` | `"auto"` | API version (or `"auto"` to detect from `package.json`). |
+| `commandCodeProvider` | `string` | `"commandcode"` | Provider slug sent to the API. |
+| `requestTimeoutMs` | `number` | `300000` | Request timeout in milliseconds (default 5 minutes). |
+| `memory` | `string` | `""` | Optional memory/context string. |
+| `headers` | `object` | `{}` | Extra HTTP headers to send with each request. |
+| `models` | `array` | bundled defaults | Model catalog; uses bundled defaults when omitted. |
 
 ## Scripts
 
-```bash
-npm run typecheck   # TypeScript type checking
-npm run build        # Build (runs typecheck)
-npm test            # Run test suite
-```
+| Script | Command | Description |
+|--------|---------|-------------|
+| `typecheck` | `tsc --noEmit` | Type-check the codebase. |
+| `build` | `npm run typecheck` | Build check (typecheck only). |
+| `test` | `node --experimental-strip-types --test test/*.test.ts` | Run the test suite. |
 
----
+## License
 
-## Architecture
-
-```
-pi-command-code-provider/
-├── src/
-│   └── index.ts        # Main extension entry
-├── test/
-│   └── *.test.ts       # Test suite
-├── package.json
-├── config.example.json
-├── README.md
-└── LICENSE
-```
-
----
-
-## Related
-
-- [CommandCode](https://commandcode.dev/) — Provider API
-- [Pi](https://github.com/your-pi) — Personal AI agent
-- [omniclaw](https://github.com/Das-rebel/omniclaw) — Full AI orchestration
-
-MIT License
+[MIT](LICENSE)
